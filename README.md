@@ -1,103 +1,218 @@
 # Claude Skills 自動チューニングシステム
 
-Claude skillsを自動的にチューニングして、Terraform生成の精度を向上させるシステム。
+## このプロジェクトは何？
 
-## 概要
+「AWSのインフラを作りたい」という要望を入力すると、実際に動くTerraformコードを生成するシステムです。
 
-要望テキストからAWSインフラのTerraformコードを生成するClaude skillsを、正解データとの突合によって自動改善します。
+さらに、**AIの出力精度を自動的に改善する仕組み**を備えています。
 
-### アプローチ
+## 解決したい問題
 
-1. **正解データ**: 実際に動くTerraformコードを収集（AWSベストプラクティスベース）
-2. **逆算**: Terraformから「どんな依頼でこれが出るか」を生成
-3. **Skills作成**: 「依頼→Terraform」のパターンをskillsに定義
-4. **検証**: skillsで依頼して、正しいTerraformが出るかチェック
-5. **自動改善**: エラーパターンを分析し、skillsを自動更新
+AIに「こんなAWS構成を作って」と依頼しても、出力されるTerraformコードが**実際には動かない**ことがほとんどです。
 
-## 実行方法
-
-### WebUI（Terraform生成）
-
-```bash
-# Docker環境でWebUIを起動
-docker compose up --build
-
-# ブラウザで http://localhost:8080 にアクセス
+```
+ユーザー: 「ALBとEC2とRDSでWebアプリ基盤を作って」
+     ↓
+AI: Terraformコードを出力
+     ↓
+実行: terraform validate → エラー！動かない...
 ```
 
-### チューニングループ実行
+## 解決アプローチ
+
+### 従来の方法（うまくいかない）
+```
+要望 → AIが推測でコード生成 → だいたい動かない
+```
+
+### このプロジェクトの方法（逆算アプローチ）
+```
+① 実際に動くTerraformコードを集める（正解データ）
+② そのコードから「どんな依頼でこれが出るか」を逆算
+③ 「依頼→コード」のパターンをAIに学習させる（Skills）
+④ AIの出力と正解を比較し、間違いを分析
+⑤ 分析結果をもとにSkillsを自動改善
+⑥ ③〜⑤を繰り返して精度を上げる
+```
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    チューニングループ                      │
+│                                                         │
+│   ┌──────────┐    ┌──────────┐    ┌──────────┐        │
+│   │ 正解データ │───▶│ Skills   │───▶│ AI実行   │        │
+│   │(Terraform)│    │ (ルール) │    │          │        │
+│   └──────────┘    └──────────┘    └────┬─────┘        │
+│                         ▲                 │             │
+│                         │                 ▼             │
+│                   ┌─────┴────┐    ┌──────────┐        │
+│                   │ 自動改善  │◀───│ 評価比較  │        │
+│                   │          │    │          │        │
+│                   └──────────┘    └──────────┘        │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+## 実験結果と精度
+
+### チューニングの推移
+
+| 回数 | 平均スコア | terraform validate通過率 | 主な改善内容 |
+|:---:|:---:|:---:|:---|
+| 1回目 | 69.4% | **100%** | 初期状態 |
+| 2回目 | 68.2% | **100%** | API Gateway v1/v2の使い分けルール追加 |
+| 3回目 | 66.9% | **100%** | アーキテクチャ判定フロー追加 |
+| 4回目 | 57.0% | 66.7% | templatefile関数の禁止ルール追加 |
+| 5回目 | 53.5% | 66.7% | 最終状態 |
+
+### 精度の見方
+
+#### terraform validate通過率（重要）
+- 生成されたコードが**構文的に正しいか**を示す指標
+- 初期3回は**100%達成** → 実用レベルのコードが生成できている
+- 4回目以降で低下 → Skillsの過学習（後述）
+
+#### 平均スコア
+以下の3つの指標を組み合わせた総合スコアです：
+
+| 指標 | 重み | 説明 |
+|:---|:---:|:---|
+| validate通過 | 30% | `terraform validate`が通るか |
+| リソース一致率 | 40% | 必要なAWSサービスが含まれているか |
+| 設定一致率 | 30% | コードの内容が正解に近いか |
+
+### 課題と考察
+
+#### うまくいったこと
+1. **terraform validate 100%達成**（初期3回）
+   - 生成されたコードは実際に動作する品質
+2. **Skillsの自動改善が機能**
+   - エラーパターンを分析し、ルールが自動追加された
+   - 例：`templatefile`関数の使用禁止ルール
+
+#### 改善が必要なこと
+1. **評価指標の改善**
+   - 現在はテキストの類似度で比較しているため、正確な評価ができていない
+   - 構造的な正しさを評価する仕組みが必要
+
+2. **正解データの拡充**
+   - 現在3パターンのみ → 10-15パターンに増やす必要あり
+
+3. **過学習の防止**
+   - 4回目以降、Skillsが複雑になりすぎてvalidate通過率が低下
+   - ルールの取捨選択が必要
+
+## Skillsとは？
+
+Claude（AI）に対する**ルールブック**のようなものです。
+
+```markdown
+# 例：Skills定義の一部
+
+## 禁止事項
+- templatefile関数の使用禁止
+- 外部ファイルへの参照禁止
+
+## サーバーレスAPIの場合
+必ず以下の4つのリソースを含めること：
+- aws_apigatewayv2_api
+- aws_apigatewayv2_stage
+- aws_apigatewayv2_route
+- aws_apigatewayv2_integration
+```
+
+このSkillsがチューニングによって自動的に改善されていきます。
+
+## 使い方
+
+### 1. WebUIでTerraform生成（かんたん）
 
 ```bash
-# Skillsの自動チューニングを実行
+# Dockerで起動
+docker compose up --build
+
+# ブラウザでアクセス
+# http://100.113.108.98:8080 （Tailscale経由の場合）
+# http://localhost:8080 （ローカルの場合）
+```
+
+1. テキストエリアに要望を入力
+2. 「Terraform生成」ボタンをクリック
+3. 生成されたコードをコピーして使用
+
+### 2. Skillsのチューニング実行
+
+```bash
+# 自動チューニングを実行（5回繰り返し）
 docker compose --profile tuning run --rm tuner
 ```
 
-## 実験結果（2025/12/23）
-
-### チューニングループ結果
-
-| Iteration | Avg Score | Validate Pass Rate | 主な改善点 |
-|-----------|-----------|-------------------|-----------|
-| 1 | 69.38% | 100% | 初回実行 |
-| 2 | 68.23% | 100% | API Gateway v1/v2の使い分け明確化 |
-| 3 | 66.87% | 100% | アーキテクチャパターン判定強化 |
-| 4 | 56.97% | 66.67% | templatefile関数使用禁止追加 |
-| 5 | 53.53% | 66.67% | チューニング完了 |
-
-### 観察と考察
-
-1. **terraform validate通過率**: 初期3イテレーションで100%達成。実用的なTerraformコードが生成できている
-2. **スコア変動**: Config Match（テキスト類似度）の変動が大きく、評価指標の改善が必要
-3. **自動改善の効果**: skillsに以下が自動追加された：
-   - `templatefile`関数の使用禁止ルール
-   - `user_data`のインライン記述ルール
-   - アーキテクチャパターン判定フローチャート
-   - サーバーレスAPI必須リソース4点セット定義
-
-### 改善すべき点
-
-1. **評価指標の改善**
-   - テキスト類似度だけでなく、構造的な正しさを評価
-   - リソース間の依存関係の評価追加
-   - セキュリティ設定の評価追加
-
-2. **正解データの拡充**
-   - 現在3パターン → 10-15パターンに拡充
-   - より複雑な構成の追加
-
-3. **skillsの初期品質向上**
-   - 実際のエラーパターンを事前に組み込み
-   - 具体的なコード例の追加
-
-## プロジェクト構造
+## ファイル構成
 
 ```
 claude-skills-automation/
-├── data/
-│   └── training/           # 正解データ（依頼→Terraformペア）
-├── skills/
-│   └── terraform-aws.md    # Claude skills定義（自動更新される）
 ├── src/
-│   ├── main.py             # メインエントリーポイント
-│   ├── runner.py           # Claude API実行
-│   ├── evaluator.py        # terraform validate + 比較評価
-│   ├── skills_updater.py   # skills自動更新
-│   └── models.py           # データモデル
-├── output/                 # 生成されたTerraform
-├── results/                # 評価結果JSON
+│   ├── web.py              # WebUI（ブラウザ画面）
+│   ├── main.py             # チューニングのメイン処理
+│   ├── runner.py           # AIにTerraformを生成させる
+│   ├── evaluator.py        # 生成結果を評価する
+│   ├── skills_updater.py   # Skillsを自動改善する
+│   └── models.py           # データ構造の定義
+├── skills/
+│   └── terraform-aws.md    # AIへのルールブック（自動改善される）
+├── data/training/          # 正解データ（要望→Terraformのペア）
+│   ├── 001_alb_ec2_rds.json    # Web3層構成
+│   ├── 002_serverless_api.json # サーバーレスAPI
+│   └── 003_ecs_fargate.json    # コンテナ構成
+├── output/                 # 生成されたTerraformコード
+├── results/                # 評価結果のJSON
 ├── Dockerfile
 ├── docker-compose.yml
-└── pyproject.toml
+└── README.md
 ```
 
-## 参考
+## 正解データの形式
 
-- https://code.claude.com/docs/ja/skills
-- https://code.claude.com/docs/ja/overview
-- https://dev.classmethod.jp/articles/trial-and-error-aws-diagram-agent-skills/
+```json
+{
+  "id": "001_alb_ec2_rds",
+  "source": "AWS Well-Architected Framework",
+  "request": "高可用性のWebアプリケーション基盤を構築したい。ALBで負荷分散し、EC2をAuto Scalingで配置、RDSはMulti-AZで冗長化。",
+  "terraform_files": {
+    "main_tf": "resource \"aws_vpc\" ...",
+    "variables_tf": "variable \"aws_region\" ...",
+    "outputs_tf": "output \"alb_dns_name\" ...",
+    "providers_tf": "terraform { ... }"
+  },
+  "tags": ["alb", "ec2", "rds", "high-availability"]
+}
+```
+
+## 今後の改善案
+
+1. **正解データの追加**
+   - より多くのAWSアーキテクチャパターンを収集
+   - 実際のプロジェクトで使われたTerraformを活用
+
+2. **評価方法の改善**
+   - リソースの依存関係を評価
+   - セキュリティ設定の評価
+   - `terraform plan`の実行結果も評価に含める
+
+3. **Skills改善ロジックの最適化**
+   - ルールの重要度を判定
+   - 矛盾するルールの自動削除
 
 ## 環境変数
+
+`.env`ファイルに以下を設定：
 
 ```
 ANTHROPIC_API_KEY=your-api-key
 ```
+
+## 参考リンク
+
+- [Claude Code Skills公式ドキュメント](https://code.claude.com/docs/ja/skills)
+- [Claude Code概要](https://code.claude.com/docs/ja/overview)
+- [参考記事：AWSダイアグラム生成の試行錯誤](https://dev.classmethod.jp/articles/trial-and-error-aws-diagram-agent-skills/)
