@@ -14,6 +14,9 @@ RUN wget -q https://releases.hashicorp.com/terraform/1.6.6/terraform_1.6.6_linux
     && mv terraform /usr/local/bin/ \
     && rm terraform_1.6.6_linux_amd64.zip
 
+# tflint（静的解析ツール）をインストール
+RUN curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+
 # uvのインストール
 RUN pip install uv
 

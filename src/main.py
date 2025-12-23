@@ -1,4 +1,4 @@
-"""メインエントリーポイント"""
+"""メインエントリーポイント（改善版フィードバックループ）"""
 import os
 import json
 from pathlib import Path
@@ -8,6 +8,7 @@ from anthropic import Anthropic
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.panel import Panel
 
 from .models import TrainingData, TerraformFiles, TuningIteration
 from .runner import load_skills, generate_terraform, save_terraform_files
@@ -74,9 +75,9 @@ def run_single_evaluation(
     return generated, result
 
 
-def print_results_table(results: list) -> None:
+def print_results_table(results: list, title: str = "Evaluation Results") -> None:
     """結果をテーブル表示"""
-    table = Table(title="Evaluation Results")
+    table = Table(title=title)
     table.add_column("Data ID", style="cyan")
     table.add_column("Validate", style="green")
     table.add_column("Resource Match", justify="right")
@@ -87,12 +88,21 @@ def print_results_table(results: list) -> None:
         validate_icon = "✓" if result.validate_passed else "✗"
         validate_style = "green" if result.validate_passed else "red"
         
+        # スコアに応じた色
+        score = result.overall_score
+        if score >= 0.7:
+            score_style = "green"
+        elif score >= 0.5:
+            score_style = "yellow"
+        else:
+            score_style = "red"
+        
         table.add_row(
             result.data_id,
             f"[{validate_style}]{validate_icon}[/{validate_style}]",
             f"{result.resource_match_rate:.2%}",
             f"{result.config_match_rate:.2%}",
-            f"{result.overall_score:.2%}"
+            f"[{score_style}]{result.overall_score:.2%}[/{score_style}]"
         )
     
     console.print(table)
@@ -116,11 +126,12 @@ def run_tuning_loop(
     target_score: float = 0.85
 ) -> None:
     """
-    チューニングループを実行
+    改善版チューニングループ
     
-    Args:
-        max_iterations: 最大イテレーション回数
-        target_score: 目標スコア
+    特徴：
+    1. スコアが上がった場合のみSkillsを更新
+    2. validate通過率が下がったらロールバック
+    3. 目標スコアに達したら早期終了
     """
     load_dotenv()
     
@@ -138,8 +149,27 @@ def run_tuning_loop(
     # スキルファイルパス
     skills_path = SKILLS_DIR / "terraform-aws.md"
     
+    # ベストスコアの追跡
+    best_score = 0.0
+    best_validate_rate = 0.0
+    best_skills = load_skills(skills_path)
+    best_iteration = 0
+    
+    # スコア履歴
+    score_history = []
+    
+    console.print(Panel.fit(
+        "[bold]改善版チューニングループ[/bold]\n"
+        "• スコアが上がった場合のみSkillsを更新\n"
+        "• validate通過率が下がったらロールバック\n"
+        "• terraform validate + tflint で厳密評価",
+        title="Tuning Strategy"
+    ))
+    
     for iteration in range(1, max_iterations + 1):
-        console.print(f"\n[bold cyan]===== Iteration {iteration} =====[/bold cyan]")
+        console.print(f"\n[bold cyan]{'='*50}[/bold cyan]")
+        console.print(f"[bold cyan]  Iteration {iteration} / {max_iterations}[/bold cyan]")
+        console.print(f"[bold cyan]{'='*50}[/bold cyan]")
         
         # スキル読み込み
         skills = load_skills(skills_path)
@@ -160,54 +190,123 @@ def run_tuning_loop(
                 progress.advance(task)
         
         # 結果表示
-        print_results_table(results)
+        print_results_table(results, f"Iteration {iteration} Results")
         
         # スコア計算
         avg_score = sum(r.overall_score for r in results) / len(results)
         validate_pass_rate = sum(1 for r in results if r.validate_passed) / len(results)
         
+        score_history.append({
+            "iteration": iteration,
+            "avg_score": avg_score,
+            "validate_rate": validate_pass_rate
+        })
+        
         console.print(f"\n[bold]Average Score: {avg_score:.2%}[/bold]")
         console.print(f"[bold]Validate Pass Rate: {validate_pass_rate:.2%}[/bold]")
         
+        # ベストスコア更新判定
+        should_update_skills = False
+        update_reason = ""
+        
+        if validate_pass_rate >= best_validate_rate:
+            if avg_score > best_score:
+                should_update_skills = True
+                update_reason = f"スコア向上: {best_score:.2%} → {avg_score:.2%}"
+                best_score = avg_score
+                best_validate_rate = validate_pass_rate
+                best_skills = skills
+                best_iteration = iteration
+            elif validate_pass_rate > best_validate_rate:
+                should_update_skills = True
+                update_reason = f"validate通過率向上: {best_validate_rate:.2%} → {validate_pass_rate:.2%}"
+                best_validate_rate = validate_pass_rate
+                best_skills = skills
+                best_iteration = iteration
+        
+        # ベストスコア表示
+        console.print(f"\n[bold green]Best Score: {best_score:.2%} (Iteration {best_iteration})[/bold green]")
+        console.print(f"[bold green]Best Validate Rate: {best_validate_rate:.2%}[/bold green]")
+        
         # 目標達成チェック
-        if avg_score >= target_score and validate_pass_rate >= 0.9:
-            console.print(f"\n[green bold]✓ Target achieved! Stopping tuning.[/green bold]")
+        if avg_score >= target_score and validate_pass_rate >= 1.0:
+            console.print(f"\n[green bold]✓ Target achieved! Score: {avg_score:.2%}[/green bold]")
             break
         
-        # エラー分析とスキル更新
+        # スコアが下がった場合はロールバック
+        if validate_pass_rate < best_validate_rate:
+            console.print(f"\n[yellow]⚠ Validate率が低下 ({validate_pass_rate:.2%} < {best_validate_rate:.2%})[/yellow]")
+            console.print("[yellow]  → ベストSkillsにロールバック[/yellow]")
+            save_skills(best_skills, skills_path)
+            continue
+        
+        # Skills更新（スコアが上がった場合のみ）
         if iteration < max_iterations:
-            console.print("\n[yellow]Analyzing errors and updating skills...[/yellow]")
-            
-            # バックアップ
-            backup_skills(skills_path, iteration)
-            
-            # エラー分析
-            error_analysis = analyze_errors(results)
-            
-            # スキル更新
-            new_skills, updates = generate_skills_update(client, skills, error_analysis)
-            
-            # 更新内容表示
-            console.print("\n[bold]Skills Updates:[/bold]")
-            for update in updates:
-                console.print(f"  • {update}")
-            
-            # 保存
-            save_skills(new_skills, skills_path)
-            
-            # イテレーション結果保存
-            iteration_result = TuningIteration(
-                iteration=iteration,
-                avg_score=avg_score,
-                validate_pass_rate=validate_pass_rate,
-                results=results,
-                skills_updates=updates
-            )
-            save_iteration_results(iteration_result)
+            if should_update_skills:
+                console.print(f"\n[green]✓ {update_reason}[/green]")
+                console.print("[green]  → Skillsを更新[/green]")
+                
+                # バックアップ
+                backup_skills(skills_path, iteration)
+                
+                # エラー分析
+                error_analysis = analyze_errors(results)
+                
+                # スキル更新
+                new_skills, updates = generate_skills_update(client, skills, error_analysis)
+                
+                # 更新内容表示
+                if updates:
+                    console.print("\n[bold]Skills Updates:[/bold]")
+                    for update in updates[:5]:  # 最大5件表示
+                        console.print(f"  • {update}")
+                
+                # 保存
+                save_skills(new_skills, skills_path)
+            else:
+                console.print(f"\n[yellow]⚠ スコアが向上しませんでした[/yellow]")
+                console.print("[yellow]  → Skills更新をスキップ[/yellow]")
+        
+        # イテレーション結果保存
+        iteration_result = TuningIteration(
+            iteration=iteration,
+            avg_score=avg_score,
+            validate_pass_rate=validate_pass_rate,
+            results=results,
+            skills_updates=updates if should_update_skills else []
+        )
+        save_iteration_results(iteration_result)
     
-    console.print("\n[bold green]Tuning completed![/bold green]")
+    # 最終結果サマリー
+    console.print("\n" + "="*60)
+    console.print("[bold]TUNING COMPLETED - SUMMARY[/bold]")
+    console.print("="*60)
+    
+    # スコア推移テーブル
+    summary_table = Table(title="Score History")
+    summary_table.add_column("Iteration", justify="center")
+    summary_table.add_column("Avg Score", justify="right")
+    summary_table.add_column("Validate Rate", justify="right")
+    summary_table.add_column("Status", justify="center")
+    
+    for h in score_history:
+        is_best = h["iteration"] == best_iteration
+        status = "[green]★ BEST[/green]" if is_best else ""
+        summary_table.add_row(
+            str(h["iteration"]),
+            f"{h['avg_score']:.2%}",
+            f"{h['validate_rate']:.2%}",
+            status
+        )
+    
+    console.print(summary_table)
+    
+    # ベストSkillsを最終版として保存
+    console.print(f"\n[bold green]Best Skills (Iteration {best_iteration}) is now active[/bold green]")
+    save_skills(best_skills, skills_path)
+    
+    console.print("\n[bold green]✓ Tuning completed![/bold green]")
 
 
 if __name__ == "__main__":
     run_tuning_loop()
-

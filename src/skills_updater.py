@@ -1,4 +1,4 @@
-"""Skills自動更新ロジック"""
+"""Skills自動更新ロジック（改善版）"""
 from pathlib import Path
 from anthropic import Anthropic
 from rich.console import Console
@@ -9,43 +9,61 @@ console = Console()
 
 def analyze_errors(results: list[EvaluationResult]) -> dict:
     """
-    エラーパターンを分析
+    エラーパターンを詳細分析
     
     Returns:
         dict: エラー分析結果
     """
     analysis = {
         "validation_errors": [],
-        "missing_resources": [],
-        "extra_resources": [],
-        "low_score_cases": []
+        "missing_resources": {},  # リソース名: 出現回数
+        "extra_resources": {},    # リソース名: 出現回数
+        "tflint_warnings": [],
+        "low_score_cases": [],
+        "high_score_cases": []    # 成功パターンも収集
     }
     
     for result in results:
+        # バリデーションエラー
         if not result.validate_passed:
             analysis["validation_errors"].append({
                 "data_id": result.data_id,
                 "error": result.validate_error
             })
         
+        # エラー分析
         for error in result.errors:
             if "Missing resources" in error:
                 resources = error.replace("Missing resources: ", "").split(", ")
-                analysis["missing_resources"].extend(resources)
+                for r in resources:
+                    analysis["missing_resources"][r] = analysis["missing_resources"].get(r, 0) + 1
             elif "Extra resources" in error:
                 resources = error.replace("Extra resources: ", "").split(", ")
-                analysis["extra_resources"].extend(resources)
+                for r in resources:
+                    analysis["extra_resources"][r] = analysis["extra_resources"].get(r, 0) + 1
+            elif "tflint" in error:
+                analysis["tflint_warnings"].append(error)
         
-        if result.overall_score < 0.7:
+        # スコア別分類
+        if result.overall_score < 0.6:
             analysis["low_score_cases"].append({
                 "data_id": result.data_id,
                 "score": result.overall_score,
                 "errors": result.errors
             })
+        elif result.overall_score >= 0.8:
+            analysis["high_score_cases"].append({
+                "data_id": result.data_id,
+                "score": result.overall_score
+            })
     
-    # 重複を除去してカウント
-    analysis["missing_resources"] = list(set(analysis["missing_resources"]))
-    analysis["extra_resources"] = list(set(analysis["extra_resources"]))
+    # 頻出する不足リソースをソート
+    analysis["missing_resources"] = dict(
+        sorted(analysis["missing_resources"].items(), key=lambda x: -x[1])
+    )
+    analysis["extra_resources"] = dict(
+        sorted(analysis["extra_resources"].items(), key=lambda x: -x[1])
+    )
     
     return analysis
 
@@ -57,18 +75,27 @@ def generate_skills_update(
     model: str = "claude-sonnet-4-20250514"
 ) -> tuple[str, list[str]]:
     """
-    エラー分析に基づいてskillsを更新
+    エラー分析に基づいてskillsを改善（改善版）
     
-    Args:
-        client: Anthropic client
-        current_skills: 現在のskills内容
-        error_analysis: エラー分析結果
-    
-    Returns:
-        tuple: (更新後のskills, 更新内容のリスト)
+    重要：
+    - 既存の良いルールは維持
+    - 追加は最小限に
+    - 具体的なエラーに対する対策のみ追加
     """
-    prompt = f"""以下はAWS Terraformコード生成のためのスキル定義です。
-このスキルを使ってTerraformを生成した結果、いくつかのエラーが発生しました。
+    # 深刻なエラーがない場合は更新しない
+    if (not error_analysis.get('validation_errors') and 
+        not error_analysis.get('missing_resources') and
+        len(error_analysis.get('low_score_cases', [])) == 0):
+        return current_skills, ["改善が不要（エラーなし）"]
+    
+    prompt = f"""あなたはTerraform Skillsの改善エキスパートです。
+以下のSkills定義とエラー分析結果を見て、**最小限の改善**を行ってください。
+
+## 重要なルール
+1. **既存のルールは維持する** - 動作しているルールは変更しない
+2. **追加は最小限に** - 具体的なエラーに対する対策のみ追加
+3. **シンプルに保つ** - 複雑なルールは避ける
+4. **過学習を防ぐ** - 汎用的なルールのみ追加
 
 ## 現在のスキル定義
 
@@ -76,31 +103,42 @@ def generate_skills_update(
 
 ## エラー分析結果
 
-### バリデーションエラー
+### バリデーションエラー（terraform validate失敗）
 {error_analysis.get('validation_errors', [])}
 
-### 不足していたリソース
-{error_analysis.get('missing_resources', [])}
+### 頻繁に不足するリソース
+{error_analysis.get('missing_resources', {})}
 
-### 余分に生成されたリソース
-{error_analysis.get('extra_resources', [])}
+### 余分に生成されるリソース
+{error_analysis.get('extra_resources', {})}
 
-### 低スコアのケース
+### tflint警告
+{error_analysis.get('tflint_warnings', [])}
+
+### 低スコアケース
 {error_analysis.get('low_score_cases', [])}
+
+### 高スコアケース（参考）
+{error_analysis.get('high_score_cases', [])}
 
 ## タスク
 
-上記のエラーを解消するために、スキル定義を改善してください。
-改善点を明確にしつつ、更新後の完全なスキル定義を出力してください。
+上記のエラーを解消するために、以下の形式で出力してください：
 
-出力形式：
-1. まず [UPDATES_START] と [UPDATES_END] で囲んで、行った改善点をリストアップしてください
-2. 次に [SKILLS_START] と [SKILLS_END] で囲んで、更新後の完全なスキル定義を出力してください
+[UPDATES_START]
+- 改善点1の説明
+- 改善点2の説明
+（最大3点まで）
+[UPDATES_END]
+
+[SKILLS_START]
+（更新後の完全なスキル定義）
+[SKILLS_END]
 
 重要：
-- 既存の良い部分は維持すること
-- エラーパターンに対する具体的な対策を追加すること
-- 実践的なTerraformコード生成に役立つ情報を追加すること
+- 既存の良いルールはそのまま維持
+- 追加するルールは具体的なエラーに対応するもののみ
+- 複雑化を避け、シンプルに保つ
 """
 
     response = client.messages.create(
@@ -119,17 +157,21 @@ def generate_skills_update(
     updates_end = content.find("[UPDATES_END]")
     if updates_start != -1 and updates_end != -1:
         updates_text = content[updates_start + len("[UPDATES_START]"):updates_end].strip()
-        updates = [line.strip().lstrip("- ") for line in updates_text.split("\n") if line.strip()]
+        updates = [line.strip().lstrip("- ").lstrip("• ") 
+                  for line in updates_text.split("\n") 
+                  if line.strip() and not line.strip().startswith("#")]
     
     # 更新後のスキルを抽出
     skills_start = content.find("[SKILLS_START]")
     skills_end = content.find("[SKILLS_END]")
     if skills_start != -1 and skills_end != -1:
         new_skills = content[skills_start + len("[SKILLS_START]"):skills_end].strip()
+        # マークダウンのコードブロックを除去
+        new_skills = new_skills.replace("```markdown", "").replace("```", "").strip()
     else:
         # マーカーがない場合は現在のスキルを維持
         new_skills = current_skills
-        updates.append("スキル更新なし（マーカーが見つかりませんでした）")
+        updates = ["スキル更新なし（マーカーが見つかりませんでした）"]
     
     return new_skills, updates
 
@@ -137,7 +179,7 @@ def generate_skills_update(
 def save_skills(skills_content: str, skills_path: Path) -> None:
     """スキルファイルを保存"""
     skills_path.write_text(skills_content, encoding="utf-8")
-    console.print(f"[green]✓[/green] Skills updated: {skills_path}")
+    console.print(f"[green]✓[/green] Skills saved: {skills_path}")
 
 
 def backup_skills(skills_path: Path, iteration: int) -> Path:
@@ -147,4 +189,3 @@ def backup_skills(skills_path: Path, iteration: int) -> Path:
         backup_path.write_text(skills_path.read_text(encoding="utf-8"), encoding="utf-8")
         console.print(f"[blue]ℹ[/blue] Skills backed up: {backup_path}")
     return backup_path
-

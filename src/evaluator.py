@@ -1,6 +1,7 @@
-"""Terraform出力の評価ロジック"""
+"""Terraform出力の評価ロジック（改善版）"""
 import subprocess
 import re
+import json
 from pathlib import Path
 from difflib import SequenceMatcher
 from rich.console import Console
@@ -31,17 +32,25 @@ def run_terraform_validate(terraform_dir: Path) -> tuple[bool, str]:
         
         # terraform validate
         validate_result = subprocess.run(
-            ["terraform", "validate"],
+            ["terraform", "validate", "-json"],
             cwd=terraform_dir,
             capture_output=True,
             text=True,
             timeout=60
         )
         
-        if validate_result.returncode != 0:
-            return False, validate_result.stderr
-        
-        return True, ""
+        try:
+            result_json = json.loads(validate_result.stdout)
+            if result_json.get("valid", False):
+                return True, ""
+            else:
+                errors = result_json.get("diagnostics", [])
+                error_msgs = [e.get("summary", "") for e in errors if e.get("severity") == "error"]
+                return False, "; ".join(error_msgs)
+        except json.JSONDecodeError:
+            if validate_result.returncode != 0:
+                return False, validate_result.stderr
+            return True, ""
     
     except subprocess.TimeoutExpired:
         return False, "Terraform command timed out"
@@ -51,8 +60,58 @@ def run_terraform_validate(terraform_dir: Path) -> tuple[bool, str]:
         return False, str(e)
 
 
+def run_tflint(terraform_dir: Path) -> tuple[int, list[str]]:
+    """
+    tflintを実行して静的解析
+    
+    Returns:
+        tuple: (警告数, 警告メッセージリスト)
+    """
+    try:
+        # tflint init
+        subprocess.run(
+            ["tflint", "--init"],
+            cwd=terraform_dir,
+            capture_output=True,
+            timeout=60
+        )
+        
+        # tflint実行
+        result = subprocess.run(
+            ["tflint", "--format=json"],
+            cwd=terraform_dir,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        try:
+            issues = json.loads(result.stdout)
+            if isinstance(issues, dict):
+                issues = issues.get("issues", [])
+            warnings = [f"{i.get('rule', {}).get('name', 'unknown')}: {i.get('message', '')}" 
+                       for i in issues]
+            return len(warnings), warnings
+        except json.JSONDecodeError:
+            return 0, []
+    
+    except subprocess.TimeoutExpired:
+        return 0, ["tflint timed out"]
+    except FileNotFoundError:
+        return 0, []  # tflintがない場合はスキップ
+    except Exception as e:
+        return 0, [str(e)]
+
+
 def extract_resources(terraform_code: str) -> set[str]:
     """Terraformコードからリソースタイプを抽出"""
+    pattern = r'resource\s+"([^"]+)"\s+"([^"]+)"'
+    matches = re.findall(pattern, terraform_code)
+    return {m[0] for m in matches}  # リソースタイプのみ
+
+
+def extract_resource_names(terraform_code: str) -> set[str]:
+    """Terraformコードからリソース名（タイプ.名前）を抽出"""
     pattern = r'resource\s+"([^"]+)"\s+"([^"]+)"'
     matches = re.findall(pattern, terraform_code)
     return {f"{m[0]}.{m[1]}" for m in matches}
@@ -62,70 +121,66 @@ def extract_data_sources(terraform_code: str) -> set[str]:
     """Terraformコードからデータソースを抽出"""
     pattern = r'data\s+"([^"]+)"\s+"([^"]+)"'
     matches = re.findall(pattern, terraform_code)
-    return {f"data.{m[0]}.{m[1]}" for m in matches}
+    return {m[0] for m in matches}
 
 
 def calculate_resource_match_rate(
     generated: dict[str, str],
     expected: TerraformFiles
-) -> float:
-    """リソース一致率を計算"""
-    gen_resources = extract_resources(generated.get("main_tf", ""))
-    exp_resources = extract_resources(expected.main_tf)
+) -> tuple[float, list[str], list[str]]:
+    """
+    リソース一致率を計算（改善版）
     
-    if not exp_resources:
-        return 1.0 if not gen_resources else 0.5
-    
-    # リソースタイプのみで比較（名前は無視）
-    gen_types = {r.split(".")[0] for r in gen_resources}
-    exp_types = {r.split(".")[0] for r in exp_resources}
+    Returns:
+        tuple: (一致率, 不足リソース, 余分リソース)
+    """
+    gen_types = extract_resources(generated.get("main_tf", ""))
+    exp_types = extract_resources(expected.main_tf)
     
     if not exp_types:
-        return 1.0
+        return 1.0 if not gen_types else 0.5, [], list(gen_types)
     
-    intersection = gen_types & exp_types
+    # 一致しているリソース
+    matched = gen_types & exp_types
+    missing = list(exp_types - gen_types)
+    extra = list(gen_types - exp_types)
+    
+    # Jaccard係数で計算
     union = gen_types | exp_types
+    if not union:
+        return 1.0, [], []
     
-    return len(intersection) / len(union) if union else 1.0
+    rate = len(matched) / len(union)
+    return rate, missing, extra
 
 
-def calculate_config_match_rate(
+def calculate_config_similarity(
     generated: dict[str, str],
     expected: TerraformFiles
 ) -> float:
-    """設定の類似度を計算（テキストベース）"""
+    """設定の類似度を計算（改善版）"""
     gen_main = generated.get("main_tf", "")
     exp_main = expected.main_tf
     
-    # 空白を正規化
+    # 空白・改行を正規化
     gen_normalized = " ".join(gen_main.split())
     exp_normalized = " ".join(exp_main.split())
     
-    return SequenceMatcher(None, gen_normalized, exp_normalized).ratio()
-
-
-def find_missing_resources(
-    generated: dict[str, str],
-    expected: TerraformFiles
-) -> list[str]:
-    """不足しているリソースを検出"""
-    gen_types = {r.split(".")[0] for r in extract_resources(generated.get("main_tf", ""))}
-    exp_types = {r.split(".")[0] for r in extract_resources(expected.main_tf)}
+    # 変数名などの違いを吸収するため、リソース構造を比較
+    gen_resources = extract_resource_names(gen_main)
+    exp_resources = extract_resource_names(exp_main)
     
-    missing = exp_types - gen_types
-    return list(missing)
-
-
-def find_extra_resources(
-    generated: dict[str, str],
-    expected: TerraformFiles
-) -> list[str]:
-    """余分なリソースを検出"""
-    gen_types = {r.split(".")[0] for r in extract_resources(generated.get("main_tf", ""))}
-    exp_types = {r.split(".")[0] for r in extract_resources(expected.main_tf)}
+    # リソース構造の類似度
+    if gen_resources or exp_resources:
+        structure_sim = len(gen_resources & exp_resources) / max(len(gen_resources | exp_resources), 1)
+    else:
+        structure_sim = 0.5
     
-    extra = gen_types - exp_types
-    return list(extra)
+    # テキスト類似度
+    text_sim = SequenceMatcher(None, gen_normalized, exp_normalized).ratio()
+    
+    # 構造を重視（70%）、テキストは参考程度（30%）
+    return structure_sim * 0.7 + text_sim * 0.3
 
 
 def evaluate(
@@ -135,47 +190,54 @@ def evaluate(
     terraform_dir: Path
 ) -> EvaluationResult:
     """
-    生成されたTerraformを評価
+    生成されたTerraformを評価（改善版）
     
-    Args:
-        data_id: データID
-        generated: 生成されたTerraformファイル
-        expected: 期待されるTerraformファイル
-        terraform_dir: Terraformファイルが保存されたディレクトリ
-    
-    Returns:
-        EvaluationResult: 評価結果
+    スコア計算：
+    - validate通過: 必須条件（通過しないと0点）
+    - リソース一致率: 50%
+    - 設定類似度: 30%
+    - tflint警告なし: 20%
     """
     errors = []
     
-    # terraform validate
+    # 1. terraform validate（必須）
     validate_passed, validate_error = run_terraform_validate(terraform_dir)
     if not validate_passed:
         errors.append(f"Validation failed: {validate_error}")
     
-    # リソース一致率
-    resource_match_rate = calculate_resource_match_rate(generated, expected)
+    # 2. tflint静的解析
+    tflint_warnings, tflint_messages = run_tflint(terraform_dir)
+    if tflint_warnings > 0:
+        errors.extend([f"tflint: {msg}" for msg in tflint_messages[:3]])  # 最大3件
     
-    # 設定一致率
-    config_match_rate = calculate_config_match_rate(generated, expected)
-    
-    # 不足・余分なリソース
-    missing = find_missing_resources(generated, expected)
+    # 3. リソース一致率
+    resource_match_rate, missing, extra = calculate_resource_match_rate(generated, expected)
     if missing:
         errors.append(f"Missing resources: {', '.join(missing)}")
-    
-    extra = find_extra_resources(generated, expected)
     if extra:
         errors.append(f"Extra resources: {', '.join(extra)}")
     
-    # 総合スコア計算
-    # validate: 30%, resource_match: 40%, config_match: 30%
-    validate_score = 1.0 if validate_passed else 0.0
-    overall_score = (
-        validate_score * 0.3 +
-        resource_match_rate * 0.4 +
-        config_match_rate * 0.3
-    )
+    # 4. 設定類似度
+    config_match_rate = calculate_config_similarity(generated, expected)
+    
+    # 5. 総合スコア計算
+    if not validate_passed:
+        # validateが通らない場合は大幅減点（最大30点）
+        overall_score = (resource_match_rate * 0.2 + config_match_rate * 0.1)
+    else:
+        # tflintスコア（警告0なら1.0、警告が増えると減点）
+        tflint_score = max(0, 1.0 - (tflint_warnings * 0.1))
+        
+        # 総合スコア
+        # validate通過: 必須
+        # リソース一致: 50%
+        # 設定類似度: 30%
+        # tflint: 20%
+        overall_score = (
+            resource_match_rate * 0.5 +
+            config_match_rate * 0.3 +
+            tflint_score * 0.2
+        )
     
     return EvaluationResult(
         data_id=data_id,
@@ -186,4 +248,3 @@ def evaluate(
         overall_score=overall_score,
         errors=errors
     )
-
